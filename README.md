@@ -45,6 +45,7 @@ LOAD rusty_sheet;
 ```bash
 git clone https://github.com/redraiment/rusty-sheet.git
 cd rusty-sheet
+git submodule update --init --recursive
 ````
 
 2. Configure the build environment:
