@@ -52,22 +52,47 @@ impl UnifiedReader {
         }
     }
 
-    /// Reads a remote file using DuckDB's read_blob functionality
-    /// This handles all protocols (http, https, s3, gs, hf, etc.) with proper credential management
+    /// Reads a remote file using DuckDB's read_blob.
+    ///
+    /// Uses the parent DuckDB connection (stored at extension init) so it can
+    /// see database-level secrets (CREATE SECRET for Aliyun OSS, MinIO, etc.).
+    /// Falls back to an in-memory connection for tests and standalone use.
     fn read_blob_with_duckdb(file_name: &str) -> Result<UnifiedReader, RustySheetError> {
-        // Create an in-memory DuckDB connection and read the blob directly
+        if let Some(conn_arc) = crate::PARENT_CONN.get() {
+            let conn = conn_arc.lock().expect("parent conn lock");
+
+            // Ensure the HTTPFS extension is loaded on this connection.
+            // read_blob delegates to httpfs for remote URLs.
+            let _ = conn.execute_batch("LOAD httpfs");
+
+            let result: Result<Vec<u8>, _> = conn.query_row(
+                "SELECT content FROM read_blob(?)",
+                [file_name],
+                |row| row.get(0),
+            );
+            drop(conn); // release lock before potential error return
+
+            let bytes = result?;
+            if bytes.is_empty() {
+                Err(UnifiedReaderError::RemoteFileNoDataError(file_name.to_owned()))?;
+            }
+            return Ok(UnifiedReader::Remote(Cursor::new(bytes)));
+        }
+
+        // Fallback: in-memory connection (tests, standalone, no parent secrets)
         let connection = duckdb::Connection::open_in_memory()?;
-        // Read the blob directly using query_row - DuckDB handles all URL types and credentials
-        let result: Result<Vec<u8>, _> = connection.query_row("SELECT content FROM read_blob(?)", [file_name], |row| row.get(0));
-        // Close connection
+        let _ = connection.execute_batch("LOAD httpfs");
+        let result: Result<Vec<u8>, _> = connection.query_row(
+            "SELECT content FROM read_blob(?)",
+            [file_name],
+            |row| row.get(0),
+        );
         connection.close().map_err(|(_, e)| e)?;
 
         let bytes = result?;
         if bytes.is_empty() {
             Err(UnifiedReaderError::RemoteFileNoDataError(file_name.to_owned()))?;
         }
-
-        // Return as in-memory cursor
         Ok(UnifiedReader::Remote(Cursor::new(bytes)))
     }
 }

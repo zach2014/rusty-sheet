@@ -17,6 +17,14 @@ use anyhow::Context;
 use anyhow::Result;
 use duckdb::Connection;
 use libduckdb_sys as ffi;
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Shared reference to the parent DuckDB connection.
+/// The connection is created during extension init, stored here so
+/// `UnifiedReader` can run `read_blob` on it. Because the connection
+/// shares the database's Secret Manager, any `CREATE SECRET`
+/// configurations (Aliyun OSS, MinIO, Cloudflare R2, etc.) are visible.
+pub(crate) static PARENT_CONN: OnceLock<Arc<Mutex<Connection>>> = OnceLock::new();
 
 /// Internal Entrypoint for error handling
 pub fn rusty_sheet_init_c_api_internal(
@@ -29,7 +37,16 @@ pub fn rusty_sheet_init_c_api_internal(
     }
     let db: ffi::duckdb_database = unsafe { *(*access).get_database.unwrap()(info) };
     let connection = unsafe { Connection::open_from_raw(db.cast())? };
-    extension_entrypoint(connection)?;
+
+    // Store the connection so UnifiedReader can use it for read_blob.
+    // The connection is wrapped in Arc<Mutex<>> for thread-safe access
+    // when table functions run on different threads.
+    let conn_arc = Arc::new(Mutex::new(connection));
+    let _ = PARENT_CONN.set(conn_arc.clone());
+
+    // Register table functions. Pass &Connection so the connection
+    // remains owned by the Arc after this function returns.
+    extension_entrypoint(&conn_arc.lock().expect("parent conn lock"))?;
     Ok(true)
 }
 
@@ -60,7 +77,7 @@ pub extern "C" fn rusty_sheet_init_c_api(
 
 /// DuckDB extension entry point.
 /// Registers all table functions with the database connection.
-pub fn extension_entrypoint(connection: Connection) -> Result<()> {
+pub fn extension_entrypoint(connection: &Connection) -> Result<()> {
     connection
         .register_table_function::<AnalyzeSheetTableFunction>("analyze_sheet")
         .context("Failed to register analyze_sheet table function")?;
